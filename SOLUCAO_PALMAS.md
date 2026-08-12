@@ -1,48 +1,53 @@
-# Solução Definitiva para a Detecção de Palmas (Bata Palma e Abra Programas)
+# Solução Profissional com Biblioteca Especializada (clap-detector)
 
-O problema principal que causava falsos positivos e fazia o launcher capturar som ambiente (como ventilador, conversas, cliques de teclado ou TV) era o uso de um **limiar estático fixo** (`THRESHOLD = 0.08`) combinado com a análise de blocos isolados de áudio, sem adaptação ao ruído de fundo do ambiente.
+Para garantir o melhor desempenho e precisão, o projeto foi migrado para utilizar a biblioteca especializada **`clap-detector`**. Esta biblioteca utiliza filtros de banda (Bandpass) e algoritmos de processamento de sinal mais robustos que os métodos manuais, resultando em uma detecção muito mais confiável.
 
 ---
 
-## 1. O que foi corrigido no código
+## 1. O que mudou?
 
-O script `clap_launcher.py` foi totalmente aprimorado com um sistema inteligente de filtragem e adaptação:
-
-| Funcionalidade Nova | Descrição Técnica |
+| Característica | Detalhe Técnico |
 | :--- | :--- |
-| **Limiar Adaptativo (*Noise Floor Tracking*)** | O sistema calcula dinamicamente o nível do ruído de fundo recente e exige que o estalo seja significativamente mais forte que a média ambiente, evitando disparos em ambientes ruidosos. |
-| **Modo de Calibração Automática (`--calibrate`)** | Analisa o seu microfone por 3 segundos em silêncio para descobrir o limiar exato do seu ambiente de forma automatizada. |
-| **Modo de Teste Visual (`--test`)** | Exibe no terminal em tempo real o valor do pico, o limiar dinâmico e o fator de queda, indicando claramente (`🔥 PALMA!` vs `ruído`) quando uma palma é reconhecida. |
+| **Biblioteca Core** | Migrado de `sounddevice` puro para `clap-detector` (que usa `PyAudio` e `SciPy`). |
+| **Filtro de Frequência** | Aplica um filtro que foca apenas na faixa de frequência das palmas (200Hz a 3200Hz), ignorando ruídos graves como vento ou motores. |
+| **Detecção de Padrões** | A biblioteca é capaz de diferenciar uma palma simples de palmas duplas, o que permite expansões futuras no seu script. |
 
 ---
 
-## 2. Passo a Passo para Atualizar e Usar
+## 2. Instalação das Novas Dependências
 
-Siga os passos abaixo no seu computador Linux para aplicar a correção e calibrar perfeitamente o seu sistema:
-
-### Passo 1: Atualizar o arquivo do projeto
-Substitua o conteúdo do seu arquivo `clap_launcher.py` local pelo código atualizado (disponível no repositório GitHub atualizado). 
-
-Se você clonou o repositório, basta puxar as alterações ou atualizar o arquivo com a versão otimizada.
-
-### Passo 2: Calibrar o microfone para o seu ambiente
-Abra o terminal na pasta do projeto e execute o comando de calibração. Fique em silêncio por 3 segundos para que o script meça o som ambiente:
+Como agora usamos bibliotecas de processamento de áudio mais avançadas, você precisará instalar algumas dependências do sistema no seu Linux:
 
 ```bash
-python3 clap_launcher.py --calibrate --test
+# 1. Instalar dependências de áudio do sistema (Debian/Ubuntu)
+sudo apt update
+sudo apt install -y portaudio19-dev python3-pyaudio build-essential python3-dev
+
+# 2. Instalar as bibliotecas Python
+pip install clap-detector scipy --break-system-packages
 ```
 
-* **O que fazer:** Observe os valores que aparecem no terminal. Dê algumas palmas leves e palmas fortes. O terminal mostrará se o sistema identificou corretamente como `🔥 PALMA!` ou se descartou como `ruído`.
+---
 
-### Passo 3: Testar com diferentes intensidades
-Se preferir definir um limiar manual após o teste, você pode passá-lo diretamente por parâmetro:
+## 3. Como usar a nova versão
+
+### Passo 1: Testar a sensibilidade
+Execute o script no modo de teste para ver como ele se comporta no seu ambiente:
 
 ```bash
-python3 clap_launcher.py --threshold 0.12 --test
+python3 clap_launcher.py --test
 ```
 
-### Passo 4: Rodar em modo normal (Daemon)
-Quando estiver satisfeito com a detecção, execute o script normalmente em segundo plano ou como serviço do Systemd:
+*   O terminal mostrará uma lista de dispositivos de áudio. O script usará o padrão do sistema automaticamente.
+*   Bata palmas e veja a mensagem `>>> [PALMA DETECTADA!] <<<` aparecer.
+
+### Passo 2: Ajustar a precisão (Opcional)
+Dentro do arquivo `clap_launcher.py`, você pode ajustar estas variáveis se a detecção estiver muito sensível ou pouco sensível:
+- `threshold_bias`: Aumente este valor (ex: para 8000) se ele estiver pegando muito ruído. Diminua (ex: para 4000) se ele não estiver pegando suas palmas.
+- `lowcut` e `highcut`: Definem a faixa de frequência. O padrão (200-3200) já é excelente para a maioria dos ambientes.
+
+### Passo 3: Rodar em produção
+Para deixar o programa rodando e abrindo seus aplicativos:
 
 ```bash
 python3 clap_launcher.py
@@ -50,30 +55,5 @@ python3 clap_launcher.py
 
 ---
 
-## 3. Configurando o Serviço Automático (Systemd)
-
-Para que o programa inicie sozinho com o seu usuário sempre que o computador ligar:
-
-1. Certifique-se de que o arquivo `clap-launcher.service` está configurado corretamente na pasta `~/.config/systemd/user/`:
-
-```ini
-[Unit]
-Description=Bata palma e abra programas (Robusto)
-After=network.target
-
-[Service]
-ExecStart=/usr/bin/python3 /caminho/completo/para/clap_launcher.py
-Restart=always
-
-[Install]
-WantedBy=default.target
-```
-
-2. Ative e inicie o serviço:
-
-```bash
-systemctl --user daemon-reload
-systemctl --user enable --now clap-launcher.service
-```
-
-Pronto! Agora o sistema diferencia perfeitamente o som ambiente e estalos corriqueiros de uma palma real.
+## 4. Vantagem de Desempenho
+Ao usar a biblioteca `clap-detector`, o processamento de sinal é feito através do **SciPy**, que é altamente otimizado para operações matemáticas complexas em áudio. Isso garante que o programa consuma o mínimo de CPU possível enquanto mantém uma vigilância constante.
