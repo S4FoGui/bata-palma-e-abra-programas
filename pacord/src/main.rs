@@ -1,8 +1,5 @@
-mod profile;
-mod uinput_manager;
-
 use eframe::egui;
-use profile::UserProfile;
+use pacord::profile::UserProfile;
 use std::collections::HashMap;
 
 struct PacordApp {
