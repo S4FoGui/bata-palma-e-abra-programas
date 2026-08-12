@@ -201,7 +201,7 @@ A configuração inicial do host usa a variável `PACORD_ALLOW_INPUT`, que aceit
 ```bash
 export PACORD_ALLOW_INPUT='keyboard,mouse,controller'
 export PACORD_SECRET='substitua-por-um-segredo-com-mais-de-16-bytes'
-cargo run --bin pacord_host -- x11 10.147.20.5:7777
+cargo run --bin pacord-host -- x11 10.147.20.5:7777
 ```
 
 No cliente, a opção **Enviar entrada** só fica efetiva quando o host anuncia uma permissão correspondente. O viewer converte teclas comuns egui para códigos Linux, envia movimento relativo, posição normalizada, botões e roda do mouse, e mapeia eventos básicos do gilrs para eixos e botões do gamepad. A janela também recebe snapshots dos cursores: cada cursor mostra um quadrado branco e uma caixa preta com o nickname; quando há evento de controle, a caixa acrescenta `[PAD]`.
