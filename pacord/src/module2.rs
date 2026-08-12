@@ -1,9 +1,10 @@
 use crate::capture::{CaptureConfig, CapturedFrame, FrameSource, XShmCapture};
+use crate::input::InputManager;
 use crate::transport::{FramePacket, FrameServer};
 use image::{imageops::FilterType, RgbaImage};
 use std::error::Error;
 use std::net::SocketAddr;
-use std::sync::mpsc::sync_channel;
+use std::sync::{mpsc::sync_channel, Arc};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
@@ -48,9 +49,10 @@ pub async fn run_x11_host(
     bind_addr: SocketAddr,
     secret: Vec<u8>,
     config: CaptureConfig,
+    input_manager: Arc<InputManager>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let (frames, _) = broadcast::channel::<FramePacket>(2);
-    let server = FrameServer::new(bind_addr, secret)?;
+    let server = FrameServer::new(bind_addr, secret)?.with_input_manager(input_manager);
     let server_frames = frames.clone();
     let server_task = tokio::spawn(async move { server.run(server_frames).await });
 
@@ -81,9 +83,10 @@ pub async fn run_wayland_host(
     bind_addr: SocketAddr,
     secret: Vec<u8>,
     config: CaptureConfig,
+    input_manager: Arc<InputManager>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let (frames, _) = broadcast::channel::<FramePacket>(2);
-    let server = FrameServer::new(bind_addr, secret)?;
+    let server = FrameServer::new(bind_addr, secret)?.with_input_manager(input_manager);
     let server_frames = frames.clone();
     let server_task = tokio::spawn(async move { server.run(server_frames).await });
 

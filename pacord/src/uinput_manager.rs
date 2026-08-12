@@ -120,6 +120,12 @@ impl ClientVirtualDevices {
         Ok(())
     }
 
+    pub fn send_mouse_wheel(&mut self, value: i32) -> Result<(), Box<dyn Error>> {
+        let ev = InputEvent::new(EventType::RELATIVE, RelativeAxisType::REL_WHEEL.0, value);
+        self.mouse.emit(&[ev])?;
+        Ok(())
+    }
+
     pub fn send_gamepad_axis(
         &mut self,
         axis: AbsoluteAxisType,

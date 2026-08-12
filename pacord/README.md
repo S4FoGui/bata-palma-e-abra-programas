@@ -191,3 +191,31 @@ O viewer recebe apenas frames após concluir o desafio HMAC-SHA-256. Ele mantém
 [5] [ZeroTier — Client Configuration](https://docs.zerotier.com/config/)
 
 [6] [X.Org — MIT Shared Memory Extension](https://xorg.freedesktop.org/releases/X11R7.7/doc/xextproto/shm.html)
+
+## Módulo 3 — entrada remota autorizada
+
+O Módulo 3 adiciona um protocolo de entrada separado do stream de vídeo. O host cria um `InputManager` por sessão, registra cada participante com apelido próprio e cria dispositivos virtuais por cliente somente quando chega o primeiro evento autorizado. Teclado, mouse e gamepad são independentes e podem ser habilitados ou revogados separadamente.
+
+A configuração inicial do host usa a variável `PACORD_ALLOW_INPUT`, que aceita `keyboard`, `mouse` e `controller` separados por vírgula. Se a variável não existir, nenhuma entrada remota é permitida:
+
+```bash
+export PACORD_ALLOW_INPUT='keyboard,mouse,controller'
+export PACORD_SECRET='substitua-por-um-segredo-com-mais-de-16-bytes'
+cargo run --bin pacord_host -- x11 10.147.20.5:7777
+```
+
+No cliente, a opção **Enviar entrada** só fica efetiva quando o host anuncia uma permissão correspondente. O viewer converte teclas comuns egui para códigos Linux, envia movimento relativo, posição normalizada, botões e roda do mouse, e mapeia eventos básicos do gilrs para eixos e botões do gamepad. A janela também recebe snapshots dos cursores: cada cursor mostra um quadrado branco e uma caixa preta com o nickname; quando há evento de controle, a caixa acrescenta `[PAD]`.
+
+Em uma sessão gráfica do host, o processo abre uma sobreposição transparente, sempre no topo e com mouse passthrough, para mostrar esses mesmos indicadores junto aos cursores reais sem bloquear a área de trabalho. O painel de controle do host permite alterar as três permissões, mostra os participantes ativos e possui o botão `REVOGAR TODAS AS ENTRADAS`. A tecla `F12` executa o mesmo bloqueio de emergência. A revogação destrói as sessões e seus dispositivos virtuais; novas sessões só podem ser registradas depois de `Reativar novas sessões`.
+
+Os eventos são validados antes de chegar ao `uinput`: códigos e valores de tecla/botão são limitados, movimentos excessivos são recusados, posições são normalizadas entre 0 e 1 e eixos de controle são limitados ao intervalo `-32768..=32767`. O transporte mantém o desafio HMAC e o limite de oito clientes. Em Wayland, o backend do portal RemoteDesktop/EIS continua sendo a integração necessária para compositores que não aceitem apenas o caminho uinput; a criação dos dispositivos virtuais é mantida para a compatibilidade do host e para gamepads.
+
+O módulo usa `/dev/uinput` e `/dev/input/uinput`. Garanta que a regra udev do Módulo 1 esteja instalada e que o usuário do serviço tenha acesso ao grupo apropriado. O PACORD não eleva privilégios automaticamente e não concede entrada sem uma permissão explícita do host.
+
+### Referências adicionais do Módulo 3
+
+[7] [Linux Kernel — uinput module](https://www.kernel.org/doc/html/latest/input/uinput.html)
+
+[8] [XDG Desktop Portal — RemoteDesktop](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html)
+
+[9] [libei — EI Protocol documentation](https://libinput.pages.freedesktop.org/libei/)

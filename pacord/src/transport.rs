@@ -1,3 +1,4 @@
+use crate::input::{InputEventPacket, InputManager, InputOverlay, InputPermissions};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -13,7 +14,7 @@ use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
 pub const MAX_CLIENTS: usize = 8;
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 const MAX_MESSAGE_BYTES: u32 = 8 * 1024 * 1024;
 const CHALLENGE_BYTES: usize = 32;
 
@@ -28,6 +29,27 @@ pub struct FramePacket {
     pub jpeg: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InputOverlayPacket {
+    pub client_id: usize,
+    pub nickname: String,
+    pub x: f32,
+    pub y: f32,
+    pub controller_active: bool,
+}
+
+impl From<InputOverlay> for InputOverlayPacket {
+    fn from(value: InputOverlay) -> Self {
+        Self {
+            client_id: value.client_id,
+            nickname: value.nickname,
+            x: value.x,
+            y: value.y,
+            controller_active: value.controller_active,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 enum ClientMessage {
     Hello {
@@ -35,14 +57,32 @@ enum ClientMessage {
         nickname: String,
         proof: [u8; 32],
     },
+    Input(InputEventPacket),
     Stop,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 enum ServerMessage {
-    Challenge { nonce: [u8; 32] },
-    Accepted { session_id: String },
-    Rejected { reason: String },
+    Challenge {
+        nonce: [u8; 32],
+    },
+    Accepted {
+        session_id: String,
+        client_id: usize,
+    },
+    Rejected {
+        reason: String,
+    },
+    InputPolicy {
+        permissions: InputPermissions,
+    },
+    Overlays {
+        overlays: Vec<InputOverlayPacket>,
+    },
+    InputAccepted,
+    InputRejected {
+        reason: String,
+    },
     Frame(FramePacket),
     Stopped,
 }
@@ -126,6 +166,8 @@ pub struct FrameServer {
     bind_addr: SocketAddr,
     secret: Arc<Vec<u8>>,
     clients: Arc<AtomicUsize>,
+    input_manager: Arc<InputManager>,
+    overlays: broadcast::Sender<Vec<InputOverlayPacket>>,
 }
 
 impl FrameServer {
@@ -135,11 +177,23 @@ impl FrameServer {
                 "o segredo do PACORD deve ter pelo menos 16 bytes".into(),
             ));
         }
+        let (overlays, _) = broadcast::channel(8);
         Ok(Self {
             bind_addr,
             secret: Arc::new(secret),
             clients: Arc::new(AtomicUsize::new(0)),
+            input_manager: Arc::new(InputManager::new(InputPermissions::none())),
+            overlays,
         })
+    }
+
+    pub fn with_input_manager(mut self, input_manager: Arc<InputManager>) -> Self {
+        self.input_manager = input_manager;
+        self
+    }
+
+    pub fn input_manager(&self) -> Arc<InputManager> {
+        self.input_manager.clone()
     }
 
     pub async fn run(&self, frames: broadcast::Sender<FramePacket>) -> Result<(), TransportError> {
@@ -168,8 +222,10 @@ impl FrameServer {
             let secret = self.secret.clone();
             let clients = self.clients.clone();
             let frames = frames.clone();
+            let input_manager = self.input_manager.clone();
+            let overlays = self.overlays.clone();
             tokio::spawn(async move {
-                let result = handle_client(stream, secret, frames).await;
+                let result = handle_client(stream, secret, frames, input_manager, overlays).await;
                 clients.fetch_sub(1, Ordering::AcqRel);
                 if let Err(error) = result {
                     log::warn!("cliente PACORD {peer} desconectado: {error}");
@@ -193,6 +249,8 @@ async fn handle_client(
     mut stream: TcpStream,
     secret: Arc<Vec<u8>>,
     frames: broadcast::Sender<FramePacket>,
+    input_manager: Arc<InputManager>,
+    overlays: broadcast::Sender<Vec<InputOverlayPacket>>,
 ) -> Result<(), TransportError> {
     let mut nonce = [0u8; CHALLENGE_BYTES];
     getrandom::fill(&mut nonce).map_err(|e| TransportError::Protocol(e.to_string()))?;
@@ -220,30 +278,72 @@ async fn handle_client(
         return Err(TransportError::Authentication);
     }
 
+    let client_id = input_manager.register(nickname);
     write_message(
         &mut stream,
         &ServerMessage::Accepted {
             session_id: Uuid::new_v4().to_string(),
+            client_id,
+        },
+    )
+    .await?;
+    write_message(
+        &mut stream,
+        &ServerMessage::InputPolicy {
+            permissions: input_manager.permissions(),
+        },
+    )
+    .await?;
+    write_message(
+        &mut stream,
+        &ServerMessage::Overlays {
+            overlays: input_manager
+                .overlays()
+                .into_iter()
+                .map(Into::into)
+                .collect(),
         },
     )
     .await?;
 
-    let mut receiver = frames.subscribe();
+    let mut frame_receiver = frames.subscribe();
+    let mut overlay_receiver = overlays.subscribe();
     loop {
         tokio::select! {
-            frame = receiver.recv() => {
+            frame = frame_receiver.recv() => {
                 match frame {
                     Ok(frame) => write_message(&mut stream, &ServerMessage::Frame(frame)).await?,
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => {
                         write_message(&mut stream, &ServerMessage::Stopped).await?;
+                        input_manager.disconnect(client_id);
                         return Ok(());
                     }
                 }
             }
+            overlay = overlay_receiver.recv() => {
+                match overlay {
+                    Ok(overlays) => write_message(&mut stream, &ServerMessage::Overlays { overlays }).await?,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => continue,
+                }
+            }
             message = read_message::<_, ClientMessage>(&mut stream) => {
                 match message? {
+                    ClientMessage::Input(event) => {
+                        match input_manager.handle_event(client_id, event) {
+                            Ok(()) => {
+                                let snapshot = input_manager.overlays().into_iter().map(Into::into).collect();
+                                let _ = overlays.send(snapshot);
+                                write_message(&mut stream, &ServerMessage::InputAccepted).await?;
+                            }
+                            Err(error) => write_message(&mut stream, &ServerMessage::InputRejected { reason: error.to_string() }).await?,
+                        }
+                    }
                     ClientMessage::Stop => {
+                        input_manager.disconnect(client_id);
+                        let snapshot = input_manager.overlays().into_iter().map(Into::into).collect();
+                        let _ = overlays.send(snapshot);
                         write_message(&mut stream, &ServerMessage::Stopped).await?;
                         return Ok(());
                     }
@@ -256,15 +356,57 @@ async fn handle_client(
     }
 }
 
-pub async fn connect_client(
+#[derive(Debug)]
+pub enum ServerEvent {
+    Frame(FramePacket),
+    InputPolicy(InputPermissions),
+    Overlays(Vec<InputOverlayPacket>),
+    InputAccepted,
+    InputRejected(String),
+    Stopped,
+}
+
+#[derive(Debug, Clone)]
+pub struct InputClientHandle {
+    outgoing: mpsc::Sender<ClientMessage>,
+}
+
+impl InputClientHandle {
+    pub fn try_send_input(&self, event: InputEventPacket) -> Result<(), TransportError> {
+        self.outgoing
+            .try_send(ClientMessage::Input(event))
+            .map_err(|error| {
+                TransportError::Protocol(format!("fila de entrada indisponível: {error}"))
+            })
+    }
+
+    pub async fn send_input(&self, event: InputEventPacket) -> Result<(), TransportError> {
+        self.outgoing
+            .send(ClientMessage::Input(event))
+            .await
+            .map_err(|_| TransportError::Protocol("canal de entrada encerrado".into()))
+    }
+
+    pub async fn stop(&self) -> Result<(), TransportError> {
+        self.outgoing
+            .send(ClientMessage::Stop)
+            .await
+            .map_err(|_| TransportError::Protocol("canal de entrada encerrado".into()))
+    }
+}
+
+async fn handshake(
     server: SocketAddr,
     nickname: String,
     secret: Vec<u8>,
-) -> Result<mpsc::Receiver<Result<FramePacket, TransportError>>, TransportError> {
+) -> Result<TcpStream, TransportError> {
     if secret.len() < 16 {
         return Err(TransportError::Protocol(
             "o segredo do PACORD deve ter pelo menos 16 bytes".into(),
         ));
+    }
+    if nickname.trim().is_empty() || nickname.len() > 64 {
+        return Err(TransportError::Protocol("apelido inválido".into()));
     }
     let mut stream = TcpStream::connect(server).await?;
     let challenge: ServerMessage = read_message(&mut stream).await?;
@@ -283,36 +425,134 @@ pub async fn connect_client(
     )
     .await?;
     match read_message::<_, ServerMessage>(&mut stream).await? {
-        ServerMessage::Accepted { .. } => {}
-        ServerMessage::Rejected { reason } => return Err(TransportError::Rejected(reason)),
-        _ => {
-            return Err(TransportError::Protocol(
-                "resposta de aceitação inválida".into(),
-            ))
-        }
+        ServerMessage::Accepted { .. } => Ok(stream),
+        ServerMessage::Rejected { reason } => Err(TransportError::Rejected(reason)),
+        _ => Err(TransportError::Protocol(
+            "resposta de aceitação inválida".into(),
+        )),
     }
+}
 
-    let (sender, receiver) = mpsc::channel(2);
+pub async fn connect_input_client(
+    server: SocketAddr,
+    nickname: String,
+    secret: Vec<u8>,
+) -> Result<
+    (
+        InputClientHandle,
+        mpsc::Receiver<Result<ServerEvent, TransportError>>,
+    ),
+    TransportError,
+> {
+    let stream = handshake(server, nickname, secret).await?;
+    let (mut reader, mut writer) = stream.into_split();
+    let (outgoing, mut outgoing_receiver) = mpsc::channel::<ClientMessage>(64);
+    let (events_sender, events_receiver) = mpsc::channel::<Result<ServerEvent, TransportError>>(16);
+    let events_for_reader = events_sender.clone();
+    tokio::spawn(async move {
+        while let Some(message) = outgoing_receiver.recv().await {
+            if let Err(error) = write_message(&mut writer, &message).await {
+                let _ = events_sender.send(Err(error)).await;
+                break;
+            }
+        }
+    });
     tokio::spawn(async move {
         loop {
-            let message = read_message::<_, ServerMessage>(&mut stream).await;
-            match message {
+            match read_message::<_, ServerMessage>(&mut reader).await {
                 Ok(ServerMessage::Frame(frame)) => {
+                    if events_for_reader
+                        .send(Ok(ServerEvent::Frame(frame)))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(ServerMessage::InputPolicy { permissions }) => {
+                    if events_for_reader
+                        .send(Ok(ServerEvent::InputPolicy(permissions)))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(ServerMessage::Overlays { overlays }) => {
+                    if events_for_reader
+                        .send(Ok(ServerEvent::Overlays(overlays)))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(ServerMessage::InputAccepted) => {
+                    if events_for_reader
+                        .send(Ok(ServerEvent::InputAccepted))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(ServerMessage::InputRejected { reason }) => {
+                    if events_for_reader
+                        .send(Ok(ServerEvent::InputRejected(reason)))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(ServerMessage::Stopped) => {
+                    let _ = events_for_reader.send(Ok(ServerEvent::Stopped)).await;
+                    break;
+                }
+                Ok(ServerMessage::Challenge { .. })
+                | Ok(ServerMessage::Accepted { .. })
+                | Ok(ServerMessage::Rejected { .. }) => {
+                    let _ = events_for_reader
+                        .send(Err(TransportError::Protocol(
+                            "mensagem de sessão inesperada".into(),
+                        )))
+                        .await;
+                    break;
+                }
+                Err(error) => {
+                    let _ = events_for_reader.send(Err(error)).await;
+                    break;
+                }
+            }
+        }
+    });
+    Ok((InputClientHandle { outgoing }, events_receiver))
+}
+
+pub async fn connect_client(
+    server: SocketAddr,
+    nickname: String,
+    secret: Vec<u8>,
+) -> Result<mpsc::Receiver<Result<FramePacket, TransportError>>, TransportError> {
+    let (_input_handle, mut events) = connect_input_client(server, nickname, secret).await?;
+    let (sender, receiver) = mpsc::channel(2);
+    tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            match event {
+                Ok(ServerEvent::Frame(frame)) => {
                     if sender.send(Ok(frame)).await.is_err() {
                         break;
                     }
                 }
-                Ok(ServerMessage::Stopped) => break,
-                Ok(ServerMessage::Rejected { reason }) => {
+                Ok(ServerEvent::Stopped) => break,
+                Ok(ServerEvent::InputRejected(reason)) => {
                     let _ = sender.send(Err(TransportError::Rejected(reason))).await;
-                    break;
                 }
-                Ok(ServerMessage::Challenge { .. }) | Ok(ServerMessage::Accepted { .. }) => {
-                    let _ = sender
-                        .send(Err(TransportError::Protocol("mensagem inesperada".into())))
-                        .await;
-                    break;
-                }
+                Ok(
+                    ServerEvent::InputPolicy(_)
+                    | ServerEvent::Overlays(_)
+                    | ServerEvent::InputAccepted,
+                ) => {}
                 Err(error) => {
                     let _ = sender.send(Err(error)).await;
                     break;
@@ -325,7 +565,11 @@ pub async fn connect_client(
 
 #[cfg(test)]
 mod tests {
-    use super::{proof, PROTOCOL_VERSION};
+    use super::{
+        connect_input_client, proof, FramePacket, FrameServer, ServerEvent, PROTOCOL_VERSION,
+    };
+    use crate::input::{InputEventPacket, InputManager, InputPermissions};
+    use std::sync::Arc;
 
     #[test]
     fn proof_depends_on_nonce_and_nickname() {
@@ -335,14 +579,16 @@ mod tests {
         assert_eq!(first, proof(secret, &nonce, "alice"));
         assert_ne!(first, proof(secret, &nonce, "bob"));
         assert_ne!(first, proof(secret, &[8u8; 32], "alice"));
-        assert_eq!(PROTOCOL_VERSION, 2);
+        assert_eq!(PROTOCOL_VERSION, 3);
     }
 
     #[tokio::test]
-    async fn authenticated_client_receives_frame() {
+    async fn authenticated_client_receives_frame_and_policy() {
         let secret = b"pacord-test-secret-1234".to_vec();
-        let bind_addr = "127.0.0.1:0".parse().unwrap();
-        let server = super::FrameServer::new(bind_addr, secret.clone()).unwrap();
+        let input = Arc::new(InputManager::new(InputPermissions::none()));
+        let server = FrameServer::new("127.0.0.1:0".parse().unwrap(), secret.clone())
+            .unwrap()
+            .with_input_manager(input);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (frames, _) = tokio::sync::broadcast::channel(2);
@@ -352,11 +598,24 @@ mod tests {
             async move { server.run_on_listener(listener, frames).await }
         });
 
-        let mut receiver = super::connect_client(address, "alice".into(), secret)
+        let (_handle, mut events) = connect_input_client(address, "alice".into(), secret)
             .await
             .expect("cliente deveria autenticar");
+        let mut saw_policy = false;
+        for _ in 0..3 {
+            if let Some(Ok(ServerEvent::InputPolicy(policy))) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+                    .await
+                    .expect("policy não chegou")
+            {
+                assert_eq!(policy, InputPermissions::none());
+                saw_policy = true;
+                break;
+            }
+        }
+        assert!(saw_policy);
         frames
-            .send(super::FramePacket {
+            .send(FramePacket {
                 sequence: 42,
                 captured_at_micros: 100,
                 width: 2,
@@ -364,13 +623,56 @@ mod tests {
                 jpeg: vec![1, 2, 3],
             })
             .unwrap();
+        let mut saw_frame = false;
+        for _ in 0..4 {
+            if let Some(Ok(ServerEvent::Frame(frame))) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+                    .await
+                    .expect("frame não chegou")
+            {
+                assert_eq!(frame.sequence, 42);
+                saw_frame = true;
+                break;
+            }
+        }
+        assert!(saw_frame);
+        server_task.abort();
+    }
 
-        let received = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+    #[tokio::test]
+    async fn input_is_rejected_when_host_permission_is_off() {
+        let secret = b"pacord-test-secret-1234".to_vec();
+        let input = Arc::new(InputManager::new(InputPermissions::none()));
+        let server = FrameServer::new("127.0.0.1:0".parse().unwrap(), secret.clone())
+            .unwrap()
+            .with_input_manager(input);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (frames, _) = tokio::sync::broadcast::channel(2);
+        let server_task = tokio::spawn({
+            let server = server.clone();
+            async move { server.run_on_listener(listener, frames).await }
+        });
+        let (handle, mut events) = connect_input_client(address, "alice".into(), secret)
             .await
-            .expect("frame não chegou a tempo")
-            .expect("canal foi encerrado")
-            .expect("cliente recebeu erro");
-        assert_eq!(received.sequence, 42);
+            .unwrap();
+        handle
+            .send_input(InputEventPacket::PointerMotion { dx: 1, dy: 1 })
+            .await
+            .unwrap();
+        let mut saw_rejection = false;
+        for _ in 0..5 {
+            if let Some(Ok(ServerEvent::InputRejected(reason))) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+                    .await
+                    .unwrap()
+            {
+                assert!(reason.contains("mouse"));
+                saw_rejection = true;
+                break;
+            }
+        }
+        assert!(saw_rejection);
         server_task.abort();
     }
 }
