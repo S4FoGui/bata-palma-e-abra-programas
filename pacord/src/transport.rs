@@ -1,9 +1,11 @@
 use crate::input::{InputEventPacket, InputManager, InputOverlay, InputPermissions};
+use crate::rooms::RoomAdmission;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::error::Error;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -14,7 +16,7 @@ use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
 pub const MAX_CLIENTS: usize = 8;
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 const MAX_MESSAGE_BYTES: u32 = 8 * 1024 * 1024;
 const CHALLENGE_BYTES: usize = 32;
 
@@ -168,6 +170,7 @@ pub struct FrameServer {
     clients: Arc<AtomicUsize>,
     input_manager: Arc<InputManager>,
     overlays: broadcast::Sender<Vec<InputOverlayPacket>>,
+    admission_file: Option<PathBuf>,
 }
 
 impl FrameServer {
@@ -184,6 +187,7 @@ impl FrameServer {
             clients: Arc::new(AtomicUsize::new(0)),
             input_manager: Arc::new(InputManager::new(InputPermissions::none())),
             overlays,
+            admission_file: std::env::var_os("PACORD_ADMISSION_FILE").map(PathBuf::from),
         })
     }
 
@@ -194,6 +198,11 @@ impl FrameServer {
 
     pub fn input_manager(&self) -> Arc<InputManager> {
         self.input_manager.clone()
+    }
+
+    pub fn with_admission_file(mut self, path: Option<PathBuf>) -> Self {
+        self.admission_file = path;
+        self
     }
 
     pub async fn run(&self, frames: broadcast::Sender<FramePacket>) -> Result<(), TransportError> {
@@ -224,8 +233,18 @@ impl FrameServer {
             let frames = frames.clone();
             let input_manager = self.input_manager.clone();
             let overlays = self.overlays.clone();
+            let admission_file = self.admission_file.clone();
             tokio::spawn(async move {
-                let result = handle_client(stream, secret, frames, input_manager, overlays).await;
+                let result = handle_client(
+                    stream,
+                    peer,
+                    secret,
+                    frames,
+                    input_manager,
+                    overlays,
+                    admission_file,
+                )
+                .await;
                 clients.fetch_sub(1, Ordering::AcqRel);
                 if let Err(error) = result {
                     log::warn!("cliente PACORD {peer} desconectado: {error}");
@@ -247,10 +266,12 @@ async fn reject_connection(mut stream: TcpStream, reason: &str) -> Result<(), Tr
 
 async fn handle_client(
     mut stream: TcpStream,
+    peer: SocketAddr,
     secret: Arc<Vec<u8>>,
     frames: broadcast::Sender<FramePacket>,
     input_manager: Arc<InputManager>,
     overlays: broadcast::Sender<Vec<InputOverlayPacket>>,
+    admission_file: Option<PathBuf>,
 ) -> Result<(), TransportError> {
     let mut nonce = [0u8; CHALLENGE_BYTES];
     getrandom::fill(&mut nonce).map_err(|e| TransportError::Protocol(e.to_string()))?;
@@ -276,6 +297,15 @@ async fn handle_client(
     if received_proof != expected {
         let _ = reject_connection(stream, "prova de posse do segredo inválida").await;
         return Err(TransportError::Authentication);
+    }
+
+    if let Some(path) = admission_file {
+        let admission = load_admission(&path)?;
+        if !admission.allows(&nickname, peer) {
+            let _ =
+                reject_connection(stream, "participante ainda não foi aprovado pelo host").await;
+            return Err(TransportError::Rejected("participante não aprovado".into()));
+        }
     }
 
     let client_id = input_manager.register(nickname);
@@ -354,6 +384,14 @@ async fn handle_client(
             }
         }
     }
+}
+
+fn load_admission(path: &std::path::Path) -> Result<RoomAdmission, TransportError> {
+    let text = std::fs::read_to_string(path).map_err(|error| {
+        TransportError::Protocol(format!("arquivo de admissão indisponível: {error}"))
+    })?;
+    toml::from_str(&text)
+        .map_err(|error| TransportError::Protocol(format!("arquivo de admissão inválido: {error}")))
 }
 
 #[derive(Debug)]
@@ -579,7 +617,7 @@ mod tests {
         assert_eq!(first, proof(secret, &nonce, "alice"));
         assert_ne!(first, proof(secret, &nonce, "bob"));
         assert_ne!(first, proof(secret, &[8u8; 32], "alice"));
-        assert_eq!(PROTOCOL_VERSION, 3);
+        assert_eq!(PROTOCOL_VERSION, 4);
     }
 
     #[tokio::test]

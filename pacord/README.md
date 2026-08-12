@@ -219,3 +219,42 @@ O módulo usa `/dev/uinput` e `/dev/input/uinput`. Garanta que a regra udev do M
 [8] [XDG Desktop Portal — RemoteDesktop](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html)
 
 [9] [libei — EI Protocol documentation](https://libinput.pages.freedesktop.org/libei/)
+
+## Módulo 4 — salas, ZeroTier e interface Plasma
+
+O Módulo 4 substitui a tela simulada por uma aplicação desktop PACORD organizada em quatro áreas: visão geral, criação/gerenciamento de sala, entrada por convite e personalização. O layout foi mantido em preto e branco, com bordas, estados textuais e controles de foco compatíveis com o uso em KDE Plasma Wayland ou X11. O binário continua usando Rust/egui/eframe para preservar a base existente; ele não é um plasmoid e não instala componentes ocultos no Plasma.
+
+Uma sala host possui nome, nickname local, IP ZeroTier, porta, ID da rede, código curto de oito caracteres e um segredo criptográfico aleatório. O convite é um documento TOML que contém o endpoint, o ID da rede, o código e o segredo. Ele deve ser compartilhado por um canal confiável. A sala aceita no máximo oito participantes contando o host; cada participante começa como `PENDING` e o host deve aprová-lo explicitamente. As permissões de teclado, mouse e controle continuam independentes e começam desativadas.
+
+Uma sala cliente é aberta colando o convite na tela **Entrar em sala**. O PACORD valida a versão, o endereço, a porta, o ID de rede, o código e o tamanho do segredo antes de iniciar o viewer. A rede ZeroTier fornece o caminho IP, mas não fornece descoberta de salas; por isso, o convite descentralizado é intencional. O cliente não assume que a conectividade equivale à aprovação do host.
+
+### Diagnóstico e ações administrativas ZeroTier
+
+A aplicação consulta o cliente local com `zerotier-cli -j status` e `zerotier-cli -j listnetworks`, mostra o estado do nó, a versão, o número de redes, dispositivos e os endereços atribuídos. Os botões **Entrar na rede informada** e **Sair da rede informada** executam respectivamente `zerotier-cli join` e `zerotier-cli leave` somente depois de um clique explícito. Dependendo da instalação Linux, esses comandos podem exigir autorização administrativa do usuário; o PACORD exibe o erro e não tenta elevar privilégios automaticamente.
+
+O diagnóstico reconhece os estados `ONLINE`, `OFFLINE` e `TUNNELED`, e exibe falhas como rede não encontrada, autorização pendente ou erro de porta. O PACORD não executa `zerotier-cli dump` automaticamente porque a saída pode conter informações sensíveis do dispositivo.
+
+### Execução do painel
+
+Para iniciar a interface principal durante o desenvolvimento:
+
+```bash
+cargo run --bin pacord
+```
+
+Para uma instalação local, instale o arquivo desktop do KDE:
+
+```bash
+mkdir -p "$HOME/.local/share/applications"
+install -m 0644 packaging/org.pacord.PACORD.desktop "$HOME/.local/share/applications/org.pacord.PACORD.desktop"
+```
+
+A interface consegue localizar `pacord-host` e `pacord-viewer` como binários irmãos. Para uma instalação em diretórios personalizados, use `PACORD_HOST_BIN` e `PACORD_VIEWER_BIN`. O painel host inicia o backend `wayland` quando `WAYLAND_DISPLAY` está definido; caso contrário, usa `x11`. A captura Wayland ainda solicita a seleção pelo portal local, conforme o Módulo 2.
+
+O Módulo 4 gerencia o ciclo de vida dos processos filhos: iniciar host ou viewer, exibir o estado `INICIANDO`, `EXECUTANDO`, `PARADO` ou `FALHA`, e encerrar a sessão com um botão explícito. Encerrar a sala interrompe o processo da sessão e marca a sala como `CLOSED`; o PACORD não mantém uma sessão oculta em segundo plano.
+
+### Limitações conscientes
+
+A sala é local ao processo e o convite é descentralizado; não há servidor de presença, diretório global ou sincronização de estado entre múltiplos hosts. O cadastro de participante na UI representa a aprovação local; a autenticação efetiva do stream continua sendo o desafio HMAC do transporte. O gerenciamento de autorização no controlador ZeroTier permanece fora do PACORD e deve ser feito pelo administrador da rede quando o status indicar `ACCESS_DENIED`.
+
+O arquivo `module4_research.md` registra as fontes e decisões de arquitetura. As referências principais são o [guia oficial do CLI ZeroTier](https://docs.zerotier.com/cli/), o [guia de desenvolvimento do Plasma](https://community.kde.org/Plasma/DeveloperGuide), a [documentação de desenvolvimento KDE](https://develop.kde.org/docs/) e a [referência de janelas winit](https://docs.rs/winit/latest/winit/window/struct.Window.html).
